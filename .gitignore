@@ -1,0 +1,19 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# Environment variables
+.env
+
+# OS junk
+.DS_Store
+
+# Logs
+*.log

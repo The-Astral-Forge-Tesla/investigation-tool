@@ -1,0 +1,241 @@
+import re
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import pdfplumber
+import pytesseract
+from PIL import Image
+import spacy
+from tqdm import tqdm
+
+from app.db import connect
+
+try:
+    NLP = spacy.load("en_core_web_sm")
+except Exception:
+    NLP = None
+
+MAX_FILE_SIZE_MB = 200
+MAX_FILE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+TEXT_EXTS = {".txt", ".md", ".log"}
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)?\d{3}[\s-]?\d{4}\b")
+URL_RE = re.compile(r"https?://\S+")
+
+# Simple aircraft registration patterns (not perfect; conservative and tunable)
+AIRCRAFT_REG_RE = re.compile(
+    r"\b("
+    r"(?:N\d{1,5}[A-Z]{0,2})"            # US N-number
+    r"|(?:G-[A-Z]{4})"                   # UK
+    r"|(?:D-[A-Z]{4})"                   # Germany
+    r"|(?:F-[A-Z]{4})"                   # France
+    r"|(?:I-[A-Z]{4})"                   # Italy
+    r"|(?:C-[A-Z]{3}[A-Z0-9])"           # Canada (rough)
+    r")\b"
+)
+
+IMO_RE = re.compile(r"\bIMO\s?\d{7}\b", re.IGNORECASE)
+
+def ingest_all(raw_dir: Path, db_path: Path):
+    raw_dir = raw_dir.resolve()
+    conn = connect(db_path)
+    cur = conn.cursor()
+
+    files = [p for p in raw_dir.rglob("*") if p.is_file()]
+    if not files:
+        print("No files found in data/raw. Add files and re-run.")
+        conn.close()
+        return
+
+    cur.execute("BEGIN;")
+
+    for file in tqdm(files, desc="Ingesting"):
+        try:
+            if file.is_symlink():
+                continue
+            if file.stat().st_size > MAX_FILE_BYTES:
+                continue
+
+            suffix = file.suffix.lower()
+
+            if suffix == ".pdf":
+                _ingest_pdf(cur, file)
+            elif suffix in IMG_EXTS:
+                _ingest_image(cur, file)
+            elif suffix in TEXT_EXTS:
+                _ingest_text(cur, file)
+            else:
+                continue
+        except Exception:
+            continue
+
+    conn.commit()
+    conn.close()
+    print("Ingestion complete.")
+
+def _ingest_pdf(cur, file: Path):
+    with pdfplumber.open(str(file)) as pdf:
+        for i, page in enumerate(pdf.pages, 1):
+            text = page.extract_text() or ""
+            text = normalize_text(text)
+            if not text.strip():
+                continue
+            doc_id = _insert_document(cur, file.name, i, text)
+            _extract_and_link(cur, doc_id, file.name, i, text)
+
+def _ingest_image(cur, file: Path):
+    img = Image.open(file)
+    text = pytesseract.image_to_string(img) or ""
+    text = normalize_text(text)
+    if not text.strip():
+        return
+    doc_id = _insert_document(cur, file.name, 1, text)
+    _extract_and_link(cur, doc_id, file.name, 1, text)
+
+def _ingest_text(cur, file: Path):
+    text = file.read_text(errors="ignore")
+    text = normalize_text(text)
+    if not text.strip():
+        return
+    doc_id = _insert_document(cur, file.name, 1, text)
+    _extract_and_link(cur, doc_id, file.name, 1, text)
+
+def _insert_document(cur, filename: str, page: int, content: str) -> int:
+    cur.execute(
+        "INSERT INTO documents(filename, page, content) VALUES (?, ?, ?)",
+        (filename, int(page), content),
+    )
+    return int(cur.lastrowid)
+
+def normalize_text(s: str) -> str:
+    s = s.replace("\x00", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+def _norm_key(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _extract_and_link(cur, doc_id: int, filename: str, page: int, text: str):
+    # --- Entities ---
+    ent_counts: Counter[Tuple[str, str, str]] = Counter()  # (text, label, normalized)
+
+    if NLP is not None:
+        doc = NLP(text)
+        for ent in doc.ents:
+            t = ent.text.strip()
+            if not t:
+                continue
+            lab = ent.label_
+            ent_counts[(t, lab, _norm_key(t))] += 1
+
+    for email in EMAIL_RE.findall(text):
+        ent_counts[(email, "EMAIL", _norm_key(email))] += 1
+
+    for phone in PHONE_RE.findall(text):
+        ent_counts[(phone, "PHONE", _norm_key(phone))] += 1
+
+    for url in URL_RE.findall(text):
+        ent_counts[(url, "URL", _norm_key(url))] += 1
+
+    # Insert entities + link doc_entities
+    entity_ids: Dict[Tuple[str, str], int] = {}
+    for (t, lab, norm), c in ent_counts.items():
+        cur.execute(
+            "INSERT OR IGNORE INTO entities(text, label, normalized) VALUES (?, ?, ?)",
+            (t, lab, norm),
+        )
+        cur.execute("SELECT id FROM entities WHERE normalized=? AND label=?", (norm, lab))
+        row = cur.fetchone()
+        if not row:
+            continue
+        eid = int(row[0])
+        entity_ids[(norm, lab)] = eid
+
+        cur.execute(
+            """
+            INSERT INTO doc_entities(doc_id, entity_id, count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(doc_id, entity_id) DO UPDATE SET count = count + excluded.count
+            """,
+            (doc_id, eid, int(c)),
+        )
+
+    # --- Assets ---
+    asset_counts: Counter[Tuple[str, str, str]] = Counter()  # (type, value, norm)
+
+    for reg in AIRCRAFT_REG_RE.findall(text):
+        asset_counts[("AIRCRAFT_REG", reg, _norm_key(reg))] += 1
+
+    for imo in IMO_RE.findall(text):
+        asset_counts[("IMO", imo, _norm_key(imo))] += 1
+
+    asset_ids: Dict[Tuple[str, str], int] = {}
+    for (atype, aval, anorm), c in asset_counts.items():
+        cur.execute(
+            "INSERT OR IGNORE INTO assets(asset_type, asset_value, normalized) VALUES (?, ?, ?)",
+            (atype, aval, anorm),
+        )
+        cur.execute("SELECT id FROM assets WHERE asset_type=? AND normalized=?", (atype, anorm))
+        row = cur.fetchone()
+        if not row:
+            continue
+        aid = int(row[0])
+        asset_ids[(atype, anorm)] = aid
+        cur.execute(
+            """
+            INSERT INTO doc_assets(doc_id, asset_id, count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(doc_id, asset_id) DO UPDATE SET count = count + excluded.count
+            """,
+            (doc_id, aid, int(c)),
+        )
+
+    # --- Events (lightweight derivation) ---
+    # Event = (date, location) within same page
+    dates = [ (norm, lab) for (norm, lab) in entity_ids.keys() if lab == "DATE" ]
+    locs = [ (norm, lab) for (norm, lab) in entity_ids.keys() if lab in ("GPE", "LOC") ]
+
+    # Only create events when we have at least one DATE and one LOCATION-like entity
+    if dates and locs:
+        for dnorm, _ in dates[:5]:
+            for lnorm, _ in locs[:5]:
+                event_key = f"{dnorm}|{lnorm}|{filename}|{page}"
+                # fetch display strings
+                cur.execute("SELECT text FROM entities WHERE normalized=? AND label='DATE' LIMIT 1", (dnorm,))
+                dtext = (cur.fetchone() or [None])[0]
+                cur.execute("SELECT text FROM entities WHERE normalized=? AND label IN ('GPE','LOC') LIMIT 1", (lnorm,))
+                ltext = (cur.fetchone() or [None])[0]
+
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO events(event_key, date_text, date_norm, location_text, location_norm, filename, page)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_key, dtext, dnorm, ltext, lnorm, filename, int(page)),
+                )
+                cur.execute("SELECT id FROM events WHERE event_key=?", (event_key,))
+                ev_row = cur.fetchone()
+                if not ev_row:
+                    continue
+                ev_id = int(ev_row[0])
+
+                # link event_entities: all PERSON/ORG + date/location entries
+                for (enorm, elab), eid in entity_ids.items():
+                    if elab in ("PERSON", "ORG", "GPE", "LOC", "DATE"):
+                        cur.execute(
+                            "INSERT OR IGNORE INTO event_entities(event_id, entity_id) VALUES (?, ?)",
+                            (ev_id, eid),
+                        )
+
+                # link event_assets
+                for (_, anorm), aid in [(k, v) for (k, v) in asset_ids.items()]:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO event_assets(event_id, asset_id) VALUES (?, ?)",
+                        (ev_id, aid),
+                    )
