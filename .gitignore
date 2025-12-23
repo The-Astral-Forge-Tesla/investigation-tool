@@ -17,3 +17,4 @@ __pycache__/
 
 # Logs
 *.log
+github_pat_*
