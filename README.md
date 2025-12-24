@@ -21,6 +21,16 @@ No cloud. No accounts. No AI hallucinations. Everything is verifiable.
 
 ---
 
+## Included Documents
+
+This repository includes publicly released documents and records used for
+analysis and indexing.
+
+These materials are included for transparency, reproducibility, and
+independent verification. No private or unlawfully obtained data is hosted.
+See `DATA_NOTICE.md` for details.
+
+
 ## Supported File Types
 - PDF: `.pdf` (page-aware)
 - Text: `.txt`, `.md`, `.log`
@@ -33,6 +43,21 @@ No cloud. No accounts. No AI hallucinations. Everything is verifiable.
 - Windows via WSL (recommended)
 
 ---
+
+## Indexed Database
+
+`forensic.db` is a prebuilt search and analysis index generated from the
+public documents in `data/raw/`.
+
+It is included to allow immediate use of the tool without requiring
+hours of local processing.
+
+### Rebuilding
+To regenerate this database from source documents:
+
+```bash
+python -m app.build_index
+
 
 ## System Dependencies (Ubuntu / WSL)
 
